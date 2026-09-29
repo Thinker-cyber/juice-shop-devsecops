@@ -1,0 +1,261 @@
+# DevSecOps pipeline for OWASP Juice Shop (an intentionally vulnerable app).
+#
+# Because the app is vulnerable by design, every scanner is configured to REPORT
+# rather than FAIL the build. Findings land in:
+#   - Security tab -> Code scanning (SARIF; free on public repos, needs GHAS on private)
+#   - Workflow run -> Artifacts (raw reports, always available)
+# To practice "security gates", flip the FAIL_ON_FINDINGS env var to "true".
+
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # weekly re-scan for newly disclosed CVEs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 24
+  NODE_OPTIONS: "--max_old_space_size=4096"
+  IMAGE_NAME: juice-shop:ci
+  FAIL_ON_FINDINGS: "false"
+  TRIVY_IMAGE: aquasec/trivy:0.74.0
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1
+  SEMGREP_IMAGE: semgrep/semgrep:1.178.0
+
+jobs:
+  # ---------------------------------------------------------------- build & test
+  build-test:
+    name: Build & unit/API tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package.json
+            frontend/package.json
+
+      - name: Install (postinstall also builds frontend + server)
+        run: npm install
+
+      - name: Server unit tests
+        run: npm run test:server
+
+      - name: API integration tests
+        run: npm run test:api
+
+  # ---------------------------------------------------------------- secrets
+  secrets-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run Gitleaks
+        run: |
+          mkdir -p reports
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo "$GITLEAKS_IMAGE" \
+            dir /repo \
+            --report-format sarif --report-path /repo/reports/gitleaks.sarif \
+            --redact --exit-code "$([ "$FAIL_ON_FINDINGS" = true ] && echo 1 || echo 0)"
+
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: reports/gitleaks.sarif
+          category: gitleaks
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gitleaks-report
+          path: reports/
+
+  # ---------------------------------------------------------------- SAST
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run Semgrep
+        run: |
+          mkdir -p reports
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan \
+              --config p/javascript --config p/typescript \
+              --config p/nodejsscan --config p/owasp-top-ten \
+              --exclude frontend/node_modules --exclude node_modules \
+              --sarif --output reports/semgrep.sarif \
+              --metrics off \
+              $([ "$FAIL_ON_FINDINGS" = true ] && echo --error)
+
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: semgrep-report
+          path: reports/
+
+  # ---------------------------------------------------------------- SCA
+  sca:
+    name: Dependency scan (Trivy fs + npm audit)
+    runs-on: ubuntu-latest
+    env:
+      npm_config_package_lock: "true" # repo .npmrc disables lockfiles; audit needs one
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Juice Shop ships no lockfile (.npmrc: package-lock=false), so generate one.
+      - name: Generate lockfiles
+        run: |
+          npm install --package-lock-only --ignore-scripts
+          (cd frontend && npm install --package-lock-only --ignore-scripts)
+
+      - name: npm audit
+        run: |
+          mkdir -p reports
+          npm audit --json > reports/npm-audit.json || true
+          (cd frontend && npm audit --json > ../reports/npm-audit-frontend.json || true)
+          npm audit --audit-level=critical || [ "$FAIL_ON_FINDINGS" != true ]
+
+      - name: Trivy filesystem scan
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" \
+            fs --scanners vuln,misconfig \
+            --format sarif --output reports/trivy-fs.sarif \
+            --exit-code "$([ "$FAIL_ON_FINDINGS" = true ] && echo 1 || echo 0)" \
+            --severity CRITICAL,HIGH,MEDIUM .
+
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: reports/trivy-fs.sarif
+          category: trivy-fs
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: sca-reports
+          path: reports/
+
+  # ---------------------------------------------------------------- container
+  container:
+    name: Build image + scan (Trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg VCS_REF="${GITHUB_SHA::8}" \
+            -t "$IMAGE_NAME" .
+          docker save "$IMAGE_NAME" -o image.tar
+
+      - name: Trivy image scan
+        run: |
+          mkdir -p reports
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" \
+            image --input image.tar \
+            --format sarif --output reports/trivy-image.sarif \
+            --exit-code "$([ "$FAIL_ON_FINDINGS" = true ] && echo 1 || echo 0)" \
+            --severity CRITICAL,HIGH
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" \
+            image --input image.tar --format cyclonedx --output reports/sbom-image.cdx.json
+
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: container-reports
+          path: reports/
+
+      - name: Hand image to DAST job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image
+          path: image.tar
+          retention-days: 1
+
+  # ---------------------------------------------------------------- DAST
+  dast:
+    name: DAST (OWASP ZAP baseline)
+    runs-on: ubuntu-latest
+    needs: container
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image
+
+      - name: Start Juice Shop
+        run: |
+          docker load -i image.tar
+          docker run -d --name juice-shop -p 3000:3000 "$IMAGE_NAME"
+          for i in $(seq 1 60); do
+            curl -fsS http://localhost:3000 >/dev/null && echo "up after ${i}s" && exit 0
+            sleep 2
+          done
+          docker logs juice-shop; exit 1
+
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: http://localhost:3000
+          cmd_options: "-a -j"          # include alpha rules, use AJAX spider (Angular SPA)
+          allow_issue_writing: false    # don't spam the repo with issues
+          fail_action: ${{ env.FAIL_ON_FINDINGS }}
+          artifact_name: zap-report
+
+      - name: Stop Juice Shop
+        if: always()
+        run: docker rm -f juice-shop || true
